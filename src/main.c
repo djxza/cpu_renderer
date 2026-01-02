@@ -52,6 +52,11 @@ typedef size_t usize;
 typedef struct {
   f32 x, y;
 } v2;
+
+typedef struct {
+  i32 x, y;
+} i2;
+
 typedef struct {
   u32 x, y;
 } u2;
@@ -232,60 +237,72 @@ void update_player(state_t *s, f32 dt, const bool *keys) {
 /* =========================
    RAYCAST
    ========================= */
-
 void draw_raycast(state_t *s) {
   renderer_t *r = &s->ren;
   player_t *p = &s->player;
 
   for (i32 x = 0; x < BUFFER_WIDTH; ++x) {
+
+    // --- camera space ---
     f32 camera_x = 2.0f * x / (f32)BUFFER_WIDTH - 1.0f;
 
-    f32 ray_dir_x = p->dir.x + p->plane.x * camera_x;
-    f32 ray_dir_y = p->dir.y + p->plane.y * camera_x;
+    // --- ray direction ---
+    v2 ray_dir = {.x = p->dir.x + p->plane.x * camera_x,
+                  .y = p->dir.y + p->plane.y * camera_x};
 
-    i32 map_x = (i32)p->pos.x;
-    i32 map_y = (i32)p->pos.y;
+    // --- current map square ---
+    i2 map = {.x = (i32)p->pos.x, .y = (i32)p->pos.y};
 
-    f32 delta_x = ray_dir_x == 0 ? 1e30f : fabsf(1.0f / ray_dir_x);
-    f32 delta_y = ray_dir_y == 0 ? 1e30f : fabsf(1.0f / ray_dir_y);
+    // --- delta distances ---
+    v2 delta = {.x = (ray_dir.x == 0.0f) ? 1e30f : fabsf(1.0f / ray_dir.x),
+                .y = (ray_dir.y == 0.0f) ? 1e30f : fabsf(1.0f / ray_dir.y)};
 
-    f32 side_x, side_y;
-    i32 step_x, step_y;
-    i32 side = 0;
+    // --- step & initial side distances ---
+    i2 step;
+    v2 side_dist;
 
-    if (ray_dir_x < 0) {
-      step_x = -1;
-      side_x = (p->pos.x - map_x) * delta_x;
+    if (ray_dir.x < 0.0f) {
+      step.x = -1;
+      side_dist.x = (p->pos.x - map.x) * delta.x;
     } else {
-      step_x = 1;
-      side_x = (map_x + 1.0f - p->pos.x) * delta_x;
+      step.x = 1;
+      side_dist.x = (map.x + 1.0f - p->pos.x) * delta.x;
     }
 
-    if (ray_dir_y < 0) {
-      step_y = -1;
-      side_y = (p->pos.y - map_y) * delta_y;
+    if (ray_dir.y < 0.0f) {
+      step.y = -1;
+      side_dist.y = (p->pos.y - map.y) * delta.y;
     } else {
-      step_y = 1;
-      side_y = (map_y + 1.0f - p->pos.y) * delta_y;
+      step.y = 1;
+      side_dist.y = (map.y + 1.0f - p->pos.y) * delta.y;
     }
 
-    while (map_data[map_y][map_x] == 0) {
-      if (side_x < side_y) {
-        side_x += delta_x;
-        map_x += step_x;
+    // --- DDA ---
+    i32 side = 0; // 0 = x side, 1 = y side
+
+    while (map_data[map.y][map.x] == 0) {
+      if (side_dist.x < side_dist.y) {
+        side_dist.x += delta.x;
+        map.x += step.x;
         side = 0;
       } else {
-        side_y += delta_y;
-        map_y += step_y;
+        side_dist.y += delta.y;
+        map.y += step.y;
         side = 1;
       }
     }
 
-    f32 perp_dist = side == 0
-                        ? (map_x - p->pos.x + (1 - step_x) * 0.5f) / ray_dir_x
-                        : (map_y - p->pos.y + (1 - step_y) * 0.5f) / ray_dir_y;
+    // --- perpendicular distance ---
+    f32 perp_dist;
+    if (side == 0) {
+      perp_dist = (map.x - p->pos.x + (1 - step.x) * 0.5f) / ray_dir.x;
+    } else {
+      perp_dist = (map.y - p->pos.y + (1 - step.y) * 0.5f) / ray_dir.y;
+    }
 
+    // --- projection ---
     i32 line_h = (i32)(BUFFER_HEIGHT / perp_dist);
+
     i32 draw_start = -line_h / 2 + BUFFER_HEIGHT / 2;
     i32 draw_end = line_h / 2 + BUFFER_HEIGHT / 2;
 
@@ -294,12 +311,15 @@ void draw_raycast(state_t *s) {
     if (draw_end >= BUFFER_HEIGHT)
       draw_end = BUFFER_HEIGHT - 1;
 
-    u32 color = wall_color(map_data[map_y][map_x]);
-    if (side)
+    // --- color & shading ---
+    u32 color = wall_color(map_data[map.y][map.x]);
+    if (side == 1)
       color = (color >> 1) & 0x7F7F7FFF;
 
-    for (i32 y = draw_start; y <= draw_end; ++y)
+    // --- draw column ---
+    for (i32 y = draw_start; y <= draw_end; ++y) {
       r->buffer[y * BUFFER_WIDTH + x] = color;
+    }
   }
 }
 
