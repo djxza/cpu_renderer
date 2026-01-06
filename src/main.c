@@ -1,8 +1,13 @@
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_error.h>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_oldnames.h>
+#include <SDL3/SDL_pixels.h>
 #include <SDL3/SDL_render.h>
+#include <SDL3/SDL_surface.h>
 #include <SDL3/SDL_video.h>
+
+#include <SDL3_image/SDL_image.h>
 
 #include <assert.h>
 #include <math.h>
@@ -20,7 +25,9 @@
 #define WIDTH 1280
 #define HEIGHT 720
 
-#define BUFFER_SCALE 4
+#define FORMAT SDL_PIXELFORMAT_ABGR8888
+
+#define BUFFER_SCALE 1
 #define BUFFER_WIDTH (WIDTH / BUFFER_SCALE)
 #define BUFFER_HEIGHT (HEIGHT / BUFFER_SCALE)
 
@@ -87,6 +94,13 @@ typedef struct {
   v2 dir;
   v2 plane;
 } player_t;
+
+typedef struct {
+  SDL_Texture *handle;
+  SDL_Rect rect;
+  u32 *pixels;
+  i32 w, h;
+} texture_t;
 
 /* =========================
    STATE
@@ -159,9 +173,9 @@ void init_renderer(state_t *s) {
   s->ren.handle = SDL_CreateRenderer(s->win.handle, NULL);
   assert(s->ren.handle);
 
-  s->ren.tex = SDL_CreateTexture(s->ren.handle, SDL_PIXELFORMAT_RGBA8888,
-                                 SDL_TEXTUREACCESS_STREAMING, BUFFER_WIDTH,
-                                 BUFFER_HEIGHT);
+  s->ren.tex =
+      SDL_CreateTexture(s->ren.handle, FORMAT, SDL_TEXTUREACCESS_STREAMING,
+                        BUFFER_WIDTH, BUFFER_HEIGHT);
 
   assert(s->ren.tex);
   SDL_SetTextureScaleMode(s->ren.tex, SDL_SCALEMODE_NEAREST);
@@ -191,9 +205,104 @@ void render(renderer_t *r) {
   SDL_RenderPresent(r->handle);
 }
 
-/* =========================
-   PLAYER UPDATE
-   ========================= */
+texture_t load_tex(state_t *ptr, const char *path) {
+  texture_t t = {0};
+
+  SDL_Surface *surf = IMG_Load(path);
+  ASSERT(surf, "Failed to load %s: %s\n", path, SDL_GetError());
+
+  SDL_Surface *temp = SDL_ConvertSurface(surf, FORMAT);
+  SDL_DestroySurface(surf);
+  ASSERT(temp, "Surface convert failed: %s\n", SDL_GetError());
+
+  t.w = temp->w;
+  t.h = temp->h;
+
+  t.pixels = malloc(t.w * t.h * sizeof(u32));
+  ASSERT(t.pixels, "Out of memory\n");
+
+  memcpy(t.pixels, temp->pixels, t.w * t.h * sizeof(u32));
+
+  for (i32 i = 0; i < t.w * t.h; ++i) {
+    u32 p = t.pixels[i];
+
+    u8 r = p & 0xFF;
+    u8 g = (p >> 8) & 0xFF;
+    u8 b = (p >> 16) & 0xFF;
+    u8 a = (p >> 24) & 0xFF;
+
+    r = (r * a) / 255;
+    g = (g * a) / 255;
+    b = (b * a) / 255;
+
+    if (a == 0) {
+      t.pixels[i] = 0;
+    } else
+      t.pixels[i] = (a << 24) | (b << 16) | (g << 8) | r;
+  }
+
+  t.handle = SDL_CreateTextureFromSurface(ptr->ren.handle, temp);
+  SDL_DestroySurface(temp);
+  ASSERT(t.handle, "Texture create failed: %s\n", SDL_GetError());
+
+  /* scale + placement */
+  t.rect.w = t.w / 2;
+  t.rect.h = t.h / 2;
+  t.rect.x = BUFFER_WIDTH - t.rect.w;
+  t.rect.y = BUFFER_HEIGHT - t.rect.h;
+
+  return t;
+}
+
+void draw_tex(renderer_t *r, texture_t tex) {
+  for (i32 y = 0; y < tex.rect.h; ++y) {
+    i32 dst_y = tex.rect.y + y;
+    if (dst_y < 0 || dst_y >= BUFFER_HEIGHT)
+      continue;
+
+    i32 src_y = y * tex.h / tex.rect.h;
+
+    for (i32 x = 0; x < tex.rect.w; ++x) {
+      i32 dst_x = tex.rect.x + x;
+      if (dst_x < 0 || dst_x >= BUFFER_WIDTH)
+        continue;
+
+      i32 src_x = x * tex.w / tex.rect.w;
+
+      u32 pixel = tex.pixels[src_y * tex.w + src_x];
+      u8 a = pixel >> 24;
+
+      if (a == 0)
+        continue;
+
+      u32 *dst = &r->buffer[dst_y * BUFFER_WIDTH + dst_x];
+
+      if (a == 255) {
+        *dst = pixel;
+      } else {
+        u32 bg = *dst;
+
+        u8 r1 = (bg >> 16) & 0xFF;
+        u8 g1 = (bg >> 8) & 0xFF;
+        u8 b1 = bg & 0xFF;
+
+        u8 r2 = (pixel >> 16) & 0xFF;
+        u8 g2 = (pixel >> 8) & 0xFF;
+        u8 b2 = pixel & 0xFF;
+
+        /*  */
+        // premultiplied alpha blend
+        *dst = (0xFF << 24) | (((r2 + r1 * (255 - a) / 255)) << 0) |
+               (((g2 + g1 * (255 - a) / 255)) << 8) |
+               (((b2 + b1 * (255 - a) / 255)) << 16);
+
+        *dst = ((r2 * a + r1 * (255 - a)) / 255 << 16) |
+               ((g2 * a + g1 * (255 - a)) / 255 << 8) |
+               ((b2 * a + b1 * (255 - a)) / 255) | 0xFF000000;
+      }
+    }
+  }
+}
 
 void update_player(state_t *s, f32 dt, const bool *keys) {
   player_t *p = &s->player;
@@ -292,13 +401,19 @@ void draw_raycast(state_t *s) {
       }
     }
 
-    // --- perpendicular distance ---
-    f32 perp_dist;
+    // --- raw wall distance ---
+    f32 raw_dist;
     if (side == 0) {
-      perp_dist = (map.x - p->pos.x + (1 - step.x) * 0.5f) / ray_dir.x;
+      raw_dist = (map.x - p->pos.x + (1 - step.x) * 0.5f) / ray_dir.x;
     } else {
-      perp_dist = (map.y - p->pos.y + (1 - step.y) * 0.5f) / ray_dir.y;
+      raw_dist = (map.y - p->pos.y + (1 - step.y) * 0.5f) / ray_dir.y;
     }
+
+    // --- fisheye correction ---
+    f32 ray_len = sqrtf(ray_dir.x * ray_dir.x + ray_dir.y * ray_dir.y);
+    v2 ray_norm = {.x = ray_dir.x / ray_len, .y = ray_dir.y / ray_len};
+
+    f32 perp_dist = raw_dist * (ray_norm.x * p->dir.x + ray_norm.y * p->dir.y);
 
     // --- projection ---
     i32 line_h = (i32)(BUFFER_HEIGHT / perp_dist);
@@ -343,6 +458,8 @@ int main(void) {
 
   u64 last = SDL_GetTicks();
 
+  texture_t hand = load_tex(&state, "./res/gfx/hand.png");
+
   while (state.win.running) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -358,8 +475,10 @@ int main(void) {
 
     update_player(&state, dt, keys);
 
-    clear_buffer(&state.ren, 0x202020FF);
+    clear_buffer(&state.ren, 0x20202000);
     draw_raycast(&state);
+
+    draw_tex(&state.ren, hand);
     render(&state.ren);
   }
 
